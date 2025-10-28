@@ -17,7 +17,7 @@ FLAG_ACK           = 0x02  # 0000 0010 → pacote é ACK
 FLAG_TEST_DROP_PKT = 0x04  # 0000 0100 → modo de teste: descartar pacotes
 FLAG_TEST_DROP_ACK = 0x08  # 0000 1000 → modo de teste: descartar ACKs
 FLAG_TEST_ERR      = 0x10  # 0001 0000 → modo de teste: corromper pacote
-
+WINDOW_SIZE       = 5     # tamanho da janela padrão
 
 
 def internet_checksum(data: bytes) -> int:
@@ -37,7 +37,7 @@ def pack_packet(
     flags: int,
     seq: int,
     ack: int,
-    window_size: int,
+    window_size: int = WINDOW_SIZE,
     payload: bytes,
 ) -> bytes:
     """
@@ -94,7 +94,7 @@ def unpack_packet(datagram: bytes) -> dict:
         "flags": flags,
         "seq": seq,
         "ack": ack,
-        "win": window_size,
+        "win": WINDOW_SIZE,
         "len": length,
         "checksum": csum,
         "checksum_ok": checksum_ok,
