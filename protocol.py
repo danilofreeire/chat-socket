@@ -18,6 +18,8 @@ FLAG_TEST_DROP_PKT = 0x04  # 0000 0100 → modo de teste: descartar pacotes
 FLAG_TEST_DROP_ACK = 0x08  # 0000 1000 → modo de teste: descartar ACKs
 FLAG_TEST_ERR      = 0x10  # 0001 0000 → modo de teste: corromper pacote
 
+
+
 def internet_checksum(data: bytes) -> int:
     """Internet checksum 16-bit (one's complement) sobre data."""
     # padding se tamanho ímpar
@@ -35,7 +37,7 @@ def pack_packet(
     flags: int,
     seq: int,
     ack: int,
-    win: int,
+    window_size: int,
     payload: bytes,
 ) -> bytes:
     """
@@ -49,13 +51,13 @@ def pack_packet(
     length = len(payload)
 
     # 1) header sem checksum
-    header_no_csum = struct.pack(_HDR_NO_CSUM, version, flags, seq, ack, win, length)
+    header_no_csum = struct.pack(_HDR_NO_CSUM, version, flags, seq, ack, window_size, length)
 
     # 2) checksum sobre header(sem csum) + payload
     csum = internet_checksum(header_no_csum + payload)
 
     # 3) header completo
-    header_full = struct.pack(_HDR_FULL, version, flags, seq, ack, win, length, csum)
+    header_full = struct.pack(_HDR_FULL, version, flags, seq, ack, window_size, length, csum)
 
     # 4) modo de teste: corromper propositalmente (se FLAG_TEST_ERR setada)
     if flags & FLAG_TEST_ERR and length > 0:
@@ -74,7 +76,7 @@ def unpack_packet(datagram: bytes) -> dict:
     if len(datagram) < HEADER_SIZE:
         raise ValueError("datagrama menor que o tamanho do cabeçalho")
 
-    version, flags, seq, ack, win, length, csum = struct.unpack(
+    version, flags, seq, ack, window_size, length, csum = struct.unpack(
         _HDR_FULL, datagram[:HEADER_SIZE]
     )
     payload = datagram[HEADER_SIZE:]
@@ -83,7 +85,7 @@ def unpack_packet(datagram: bytes) -> dict:
         raise ValueError(f"LEN={length} não bate com bytes de payload={len(payload)}")
 
     # Recalcular checksum como recebido (sem alterar nada):
-    header_no_csum = struct.pack(_HDR_NO_CSUM, version, flags, seq, ack, win, length)
+    header_no_csum = struct.pack(_HDR_NO_CSUM, version, flags, seq, ack, window_size, length)
     expected = internet_checksum(header_no_csum + payload)
     checksum_ok = (expected == csum)
 
@@ -92,7 +94,7 @@ def unpack_packet(datagram: bytes) -> dict:
         "flags": flags,
         "seq": seq,
         "ack": ack,
-        "win": win,
+        "win": window_size,
         "len": length,
         "checksum": csum,
         "checksum_ok": checksum_ok,

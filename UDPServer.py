@@ -44,7 +44,7 @@ def main():
             flags=FLAG_DATA,
             seq=0,
             ack=packageClient["seq"] + 1,
-            win=10,
+            window_size=10,
             payload=data
         )
 
