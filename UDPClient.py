@@ -6,7 +6,7 @@ import select
 
 SERVER_NAME = "localhost"
 SERVER_PORT = 12000
-TIMEOUT = 1.0
+TIMEOUT = 4.0
 
 
 def removePackagesReceivedUpTo(base, packages):
