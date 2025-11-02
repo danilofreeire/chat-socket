@@ -2,10 +2,14 @@ from socket import *
 from protocol import unpack_packet, pack_packet, FLAG_DATA, FLAG_ACK, WINDOW_SIZE
 import time
 import sys
-import select
-import sys
+import threading
 
-sys.stdout.reconfigure(encoding="utf-8")
+# Evita problema de encoding no Windows ao imprimir acentos
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 SERVER_NAME = "localhost"
 SERVER_PORT = 12000
 TIMEOUT = 4.0
@@ -17,115 +21,170 @@ def removePackagesReceivedUpTo(base, packages):
             del packages[seq]
 
 
-def main():
+class State:
+    def __init__(self):
+        self.base = 1
+        self.nextSequenceNumber = 1
+        self.packages = {}
+        self.timer_start = None
+        self.peer_window = WINDOW_SIZE
+        self.lock = threading.Lock()
 
+
+def receiver_loop(sock: socket, st: State):
+    """Thread que escuta o servidor continuamente e:
+    - imprime mensagens de dados
+    - processa ACKs (GBN)
+    """
+    sock.settimeout(0.5)
+    while True:
+        try:
+            datagram, addr = sock.recvfrom(2048)
+        except timeout:
+            continue
+        except OSError:
+            # socket fechado
+            break
+        except Exception:
+            continue
+
+        try:
+            pkt = unpack_packet(datagram)
+        except Exception:
+            continue
+
+        if not pkt["checksum_ok"]:
+            # pacote corrompido, ignora
+            continue
+
+        with st.lock:
+            # Atualiza janela anunciada pelo servidor
+            st.peer_window = pkt.get("win", WINDOW_SIZE)
+
+            # Se vier payload de dados, imprime como mensagem de chat
+            if pkt["flags"] & FLAG_DATA:
+                if pkt["payload"]:
+                    msg = pkt["payload"].decode(errors="ignore").strip()
+                    if msg:
+                        print(f"\n{msg}")
+                        # re-exibe prompt visual
+                    # print("> ", end="", flush=True)
+
+            # Processa ACK
+            acknum = pkt.get("ack", None)
+            if acknum is not None and acknum >= st.base - 1:
+                st.base = acknum + 1
+                removePackagesReceivedUpTo(st.base, st.packages)
+
+                # controle do timer GBN
+                if st.base == st.nextSequenceNumber:
+                    st.timer_start = None
+                else:
+                    st.timer_start = time.monotonic()
+
+            # print(f"ACK recebido: {acknum}")
+            # print("> ", end="", flush=True)
+
+
+def main():
     try:
         clientSocket = socket(AF_INET, SOCK_DGRAM)
         serverAddress = (SERVER_NAME, SERVER_PORT)
-        clientSocket.settimeout(0.05)  # checa o timer a cada 50 ms
 
-        # estado
-        base = 1
-        nextSequenceNumber = 1
-        packages = {}
-        # timer lógico do pacote 'base'
-        timer_start = None  # None = parado; caso contrário guarda time.monotonic()
-        peer_window = WINDOW_SIZE  # janela do servidor (inicialmente padrão)
+        st = State()
 
         print("Digite mensagens (ou /quit pra sair):")
+        # print("> ", end="", flush=True)
 
+        # Inicia thread de recepção contínua
+        recv_thr = threading.Thread(
+            target=receiver_loop, args=(clientSocket, st), daemon=True
+        )
+        recv_thr.start()
+
+        # Loop de envio (pode bloquear no stdin sem prejudicar a recepção)
         while True:
-            try:  # se o usuário digitou algo
-                msg = sys.stdin.readline().strip()
-            except EOFError:
-                msg = ""
-            if not msg:
-                pass
-            else:
-                if msg == "/quit":
-                    break
-
-                message = msg.encode()
-
-                # ===== ENVIO =====
-                # envia apenas se houver espaço na janela
-
-                # A janela efetiva é o mínimo entre a local e a anunciada
-                janela_efetiva = min(WINDOW_SIZE, peer_window)
-
-                if nextSequenceNumber < base + janela_efetiva:
-                    sequence_number = (
-                        nextSequenceNumber  # número de sequência do pacote atual
-                    )
-                    packageClient = pack_packet(
-                        version=1,
-                        flags=FLAG_DATA,
-                        seq=sequence_number,
-                        ack=0,
-                        window_size=WINDOW_SIZE,
-                        payload=message,
-                    )
-                    packages[sequence_number] = packageClient
-                    print(f"Enviando pacote seq={sequence_number}")
-                    clientSocket.sendto(packageClient, serverAddress)
-
-                    # se for o primeiro da janela, inicia/reinicia o timer lógico
-                    if base == nextSequenceNumber:
-                        timer_start = time.monotonic()
-
-                    nextSequenceNumber += 1
-                else:
-                    print(
-                        f"⚠️ Janela cheia (efetiva={janela_efetiva}, peer_win={peer_window}), aguardando ACKs..."
-                    )
-            # tenta receber pacotes do servidor
             try:
-                datagram, addr = clientSocket.recvfrom(2048)
-                packageServer = unpack_packet(datagram)
+                line = sys.stdin.readline()
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                line = ""
 
-                if not packageServer["checksum_ok"]:
-                    print("⚠️ Pacote com erro no checksum, descartado.")
+            if line is None:
+                line = ""
+            msg = line.strip()
+            if not msg:
+                # print("> ", end="", flush=True)
+                # sem entrada, volta pro prompt
+                # (a thread de recepção continua rodando)
+                continue
+
+            if msg == "/quit":
+                break
+
+            payload = msg.encode()
+
+            with st.lock:
+                # janela efetiva = min(minha_janela, janela_anunciada_pelo_servidor)
+                janela_efetiva = min(WINDOW_SIZE, st.peer_window)
+
+                if st.nextSequenceNumber >= st.base + janela_efetiva:
+                    print(
+                        f"Janela cheia (efetiva={janela_efetiva}, peer_win={st.peer_window}). Aguarde ACKs."
+                    )
+                    # print("> ", end="", flush=True)
                     continue
 
-                ackNumberServer = packageServer.get("ack", None)
-                peer_window = packageServer.get(
-                    "win", WINDOW_SIZE
-                )  # ← atualização da janela do servidor
-
-                if ackNumberServer is not None and ackNumberServer >= base - 1:
-                    base = ackNumberServer + 1
-                    # remove pacotes confirmados
-                    removePackagesReceivedUpTo(base, packages)
-
-                    # se esvaziou a janela, para; senão, reinicia o timer pro novo base
-                    if base == nextSequenceNumber:
-                        timer_start = None  # para o timer lógico
-
-                    else:
-                        timer_start = time.monotonic()  # reinicia o timer lógico
-
-                    print(f"✅ ACK recebido: {ackNumberServer}")
-                    if packageServer["payload"]:
-                        resposta = packageServer["payload"].decode(errors="ignore")
-                        print(f"💬 Servidor respondeu: {resposta}")
-            except timeout:
-                pass  # sem ACK agora, segue pra checar o timer
-
-            # CHECAGEM DO TIMER (Go-Back-N)
-            if timer_start is not None and (time.monotonic() - timer_start) >= TIMEOUT:
-                # estourou: retransmite de base até o último enviado
-                print(
-                    f"⏱️ Timeout! retransmitindo pacotes a partir do seq={base}-{nextSequenceNumber-1}..."
+                seq = st.nextSequenceNumber
+                pkt = pack_packet(
+                    version=1,
+                    flags=FLAG_DATA,
+                    seq=seq,
+                    ack=0,
+                    window_size=WINDOW_SIZE,
+                    payload=payload,
                 )
-                for sequence_number in range(base, nextSequenceNumber):
-                    clientSocket.sendto(packages[sequence_number], serverAddress)
-                # reinicia o timer do (novo) base
-                timer_start = time.monotonic()
-    except KeyboardInterrupt:
-        print("\n🛑 Interrompido pelo usuário (Ctrl+C). Fechando socket...")
+                st.packages[seq] = pkt
 
+                try:
+                    clientSocket.sendto(pkt, serverAddress)
+                # print(f"Enviando pacote seq={seq}")
+                except Exception as e:
+                    print(f"Erro ao enviar: {e}")
+                    # print("> ", end="", flush=True)
+                    continue
+
+                if st.base == st.nextSequenceNumber:
+                    st.timer_start = time.monotonic()
+
+                st.nextSequenceNumber += 1
+
+            # checa timeout GBN após envio
+            with st.lock:
+                if (
+                    st.timer_start is not None
+                    and (time.monotonic() - st.timer_start) >= TIMEOUT
+                ):
+                    print(
+                        f"Timeout! Retransmitindo {st.base}..{st.nextSequenceNumber-1}"
+                    )
+                    for resend_seq in range(st.base, st.nextSequenceNumber):
+                        try:
+                            clientSocket.sendto(st.packages[resend_seq], serverAddress)
+                        except Exception as e:
+                            print(f"Erro ao retransmitir seq={resend_seq}: {e}")
+                    st.timer_start = time.monotonic()
+
+            # print("> ", end="", flush=True)
+
+    except KeyboardInterrupt:
+        print("\nInterrompido pelo usuário.")
     finally:
-        clientSocket.close()
+        try:
+            clientSocket.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
