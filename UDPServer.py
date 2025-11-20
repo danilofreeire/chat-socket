@@ -3,25 +3,48 @@ from protocol import unpack_packet, pack_packet, FLAG_DATA, FLAG_ACK
 import time
 
 SERVER_PORT = 12000
-RECV_CAPACITY = 10  # capacidade máxima de "buffer" do servidor (em pacotes)
+RECV_CAPACITY = 10
+TIMEOUT = 4.0  # Tempo para o servidor retransmitir
 
 
 def main():
     serverSocket = socket(AF_INET, SOCK_DGRAM)
     serverSocket.bind(("", SERVER_PORT))
+    serverSocket.settimeout(0.5)  # Necessário para checar retransmissão periodicamente
     print(f"Server pronto em {SERVER_PORT} \n")
 
     # ── Tabelas de estado ───────────────────────────────────────────────
     clients = {}  # (ip, porta): timestamp do último pacote
-    expectedNumberSequence = {}  # próximo número de sequência esperado por cliente
-    lastAck = {}  # último ACK cumulativo enviado por cliente
-    recvBufferUsage = {}  # simula ocupação de buffer (para controle de fluxo)
-    usernames = {}  # (ip, porta): nome do usuário
+    expectedNumberSequence = {}  # Próximo SEQ esperado DO cliente (Recebimento)
+    lastAck = {}  # Último ACK enviado AO cliente
+    recvBufferUsage = {}  # Controle de fluxo
+    usernames = {}  # Nome do usuário
+
+    # [NOVO] Estruturas para retransmissão do Servidor -> Cliente
+    # { (ip, porta): { seq: {'pkt': bytes, 'time': float} } }
+    forward_buffer = {}
+    # { (ip, porta): int } -> Próximo SEQ a enviar PARA o cliente
+    server_seq_out = {}
 
     try:
         while True:
             try:
                 datagram, clientAddress = serverSocket.recvfrom(2048)
+            except timeout:
+                # [NOVO] Verifica timeouts de retransmissão do servidor
+                now = time.time()
+                for dest_addr, buffer in forward_buffer.items():
+                    for seq_num, item in list(buffer.items()):
+                        if now - item["time"] >= TIMEOUT:
+                            print(
+                                f"⏳ [SERVER] Timeout p/ {dest_addr} seq={seq_num}. Retransmitindo..."
+                            )
+                            try:
+                                serverSocket.sendto(item["pkt"], dest_addr)
+                                item["time"] = now  # Reinicia timer
+                            except Exception as e:
+                                print(f"Erro retransmissão server: {e}")
+                continue
             except Exception as e:
                 print("Erro ao receber pacote:", e)
                 continue
@@ -34,6 +57,8 @@ def main():
                 expectedNumberSequence[clientAddress] = 1
                 lastAck[clientAddress] = 0
                 recvBufferUsage[clientAddress] = 0
+                forward_buffer[clientAddress] = {}
+                server_seq_out[clientAddress] = 1
                 print(f"[NOVO CLIENTE] {clientAddress} (total={len(clients)})")
                 print(f"Clientes atuais: {list(clients.keys())}\n")
 
@@ -47,15 +72,29 @@ def main():
             sequenceNumber = packageClient["seq"]
             checksumOk = packageClient["checksum_ok"]
             flags = packageClient["flags"]
-            expectedNumber = expectedNumberSequence[clientAddress]
 
+            # [NOVO] Tratamento de ACKs puros vindos do Cliente (Confirmação de msg encaminhada)
+            # Se for apenas ACK (sem dados), removemos do buffer de retransmissão
+            if checksumOk and (flags & FLAG_ACK) and not (flags & FLAG_DATA):
+                ack_rec = packageClient["ack"]
+                if (
+                    clientAddress in forward_buffer
+                    and ack_rec in forward_buffer[clientAddress]
+                ):
+                    del forward_buffer[clientAddress][ack_rec]
+                    print(
+                        f"✅ [SERVER] ACK {ack_rec} recebido de {clientAddress}. Retirado do buffer."
+                    )
+                continue
+
+            # Processamento normal de DADOS
+            expectedNumber = expectedNumberSequence[clientAddress]
             print(
                 f"[{clientAddress}] seq={sequenceNumber} esperado={expectedNumber} ok={checksumOk}"
             )
 
-            # Simula "espaço livre" no buffer para controle de fluxo
             used = recvBufferUsage.get(clientAddress, 0)
-            free = max(RECV_CAPACITY - used, 0)  # janela anunciada (win)
+            free = max(RECV_CAPACITY - used, 0)
             if free == 0:
                 print(f"🚫 Buffer cheio, anunciando win=0 para {clientAddress}")
 
@@ -64,17 +103,15 @@ def main():
                 try:
                     raw_text = packageClient["payload"].decode(errors="ignore")
 
-                    # se ainda não conhecemos o nome deste cliente → primeira msg é o username
+                    # Login / Username
                     if clientAddress not in usernames:
                         usernames[clientAddress] = (
                             raw_text.strip() or f"{clientAddress[0]}:{clientAddress[1]}"
                         )
-
-                        # atualiza estado
                         lastAck[clientAddress] = sequenceNumber
                         expectedNumberSequence[clientAddress] = expectedNumber + 1
 
-                        # envia apenas ACK (não encaminha)
+                        # ACK do login
                         ack_only = pack_packet(
                             version=1,
                             flags=FLAG_ACK,
@@ -84,12 +121,10 @@ def main():
                             payload=b"",
                         )
                         serverSocket.sendto(ack_only, clientAddress)
-                        print(
-                            f"👤 Username registrado: {usernames[clientAddress]} para {clientAddress}"
-                        )
+                        print(f"👤 Username registrado: {usernames[clientAddress]}")
                         continue
 
-                    # a partir daqui são mensagens normais
+                    # Mensagem normal (Encaminhamento)
                     sender_name = usernames.get(
                         clientAddress, f"{clientAddress[0]}:{clientAddress[1]}"
                     )
@@ -98,11 +133,11 @@ def main():
 
                     recvBufferUsage[clientAddress] = min(RECV_CAPACITY, used + 1)
 
-                    # atualiza estado
+                    # Atualiza estado (Recebimento)
                     lastAck[clientAddress] = sequenceNumber
                     expectedNumberSequence[clientAddress] = expectedNumber + 1
 
-                    # envia ACK para o remetente
+                    # Envia ACK para o REMETENTE (Confirmando que o server recebeu)
                     ack_pkt = pack_packet(
                         version=1,
                         flags=FLAG_ACK,
@@ -112,28 +147,39 @@ def main():
                         payload=b"",
                     )
                     serverSocket.sendto(ack_pkt, clientAddress)
-                    print(
-                        f"⏩ ACK enviado ao remetente {clientAddress} (ack={lastAck[clientAddress]})"
-                    )
+                    print(f"⏩ ACK enviado ao remetente {clientAddress}")
 
-                    # escolhe destinatário
+                    # Escolhe destinatário e ENCAMINHA
                     other = next(
                         (c for c in clients.keys() if c != clientAddress), None
                     )
                     if other:
+                        # [NOVO] Lógica de envio confiável para o DESTINATÁRIO
+                        seq_out = server_seq_out.get(other, 1)
+
                         fwd_pkt = pack_packet(
                             version=1,
                             flags=FLAG_DATA,
-                            seq=0,
+                            seq=seq_out,  # Usa sequencial real
                             ack=0,
                             window_size=free,
                             payload=data_to_send,
                         )
+
+                        # Guarda no buffer para retransmitir se necessário
+                        if other not in forward_buffer:
+                            forward_buffer[other] = {}
+                        forward_buffer[other][seq_out] = {
+                            "pkt": fwd_pkt,
+                            "time": time.time(),
+                        }
+                        server_seq_out[other] = seq_out + 1
+
                         serverSocket.sendto(fwd_pkt, other)
-                        print(f"📤 Mensagem encaminhada para {other}")
+                        print(f"📤 Mensagem encaminhada para {other} (seq={seq_out})")
                     else:
-                        # nenhum outro cliente — responde informando
-                        info = "Nenhum outro cliente conectado ainda; sua mensagem nao foi encaminhada."
+                        # Nenhum destinatário (não precisa salvar no buffer pois é aviso do sistema)
+                        info = "Nenhum outro cliente conectado ainda."
                         info_pkt = pack_packet(
                             version=1,
                             flags=FLAG_DATA | FLAG_ACK,
@@ -143,11 +189,8 @@ def main():
                             payload=f"[servidor] {info}".encode(),
                         )
                         serverSocket.sendto(info_pkt, clientAddress)
-                        print(
-                            "ℹ️  Nenhum destinatario disponivel; informei o remetente."
-                        )
+                        print("ℹ️  Nenhum destinatario disponivel.")
 
-                    # libera buffer simulado
                     if recvBufferUsage[clientAddress] > 0:
                         recvBufferUsage[clientAddress] -= 1
 
@@ -155,7 +198,7 @@ def main():
                     print("Descartando pacote inválido:", e)
                     continue
 
-            # ── Pacote duplicado, fora de ordem ou com erro ────────────────
+            # ── Pacote duplicado ou erro ────────────────
             else:
                 dupAckNumber = lastAck.get(clientAddress, 0)
                 packageServer = pack_packet(
@@ -170,7 +213,7 @@ def main():
                 print(f"↩️  DUP-ACK reenviado ({dupAckNumber})")
 
     except KeyboardInterrupt:
-        print("\n🛑 Interrompido pelo usuário (Ctrl+C). Fechando socket...")
+        print("\n🛑 Interrompido pelo usuário.")
     finally:
         serverSocket.close()
 

@@ -87,7 +87,7 @@ class ChatInterface(ctk.CTk):
         super().__init__()
         self.username = username
         self.title(f"Chat UDP - {self.username}")
-        self.geometry("820x520")
+        self.geometry("900x600")  # Aumentei um pouco para caber os testes
 
         # layout
         self.grid_columnconfigure(0, weight=0)
@@ -95,20 +95,49 @@ class ChatInterface(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
 
         # sidebar
-        sidebar = ctk.CTkFrame(self, width=200)
+        sidebar = ctk.CTkFrame(self, width=220)
         sidebar.grid(row=0, column=0, rowspan=3, sticky="nsew", padx=(10, 6), pady=10)
+
         ctk.CTkLabel(sidebar, text="Conversas", font=("", 16, "bold")).pack(
             anchor="w", padx=12, pady=(12, 8)
         )
-        self.rooms = ctk.CTkScrollableFrame(sidebar, width=180, height=420)
-        self.rooms.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+        self.rooms = ctk.CTkScrollableFrame(sidebar, width=180, height=200)
+        self.rooms.pack(fill="x", padx=8, pady=(0, 12))
+
         self.current_room = "Sala geral"
         self.room_btn = ctk.CTkButton(self.rooms, text="Sala geral", fg_color="gray25")
         self.room_btn.pack(fill="x", padx=6, pady=4)
-        switch_btn = ctk.CTkButton(
-            sidebar, text="Trocar usuário", command=self._switch_user
+
+        # --- ÁREA DE TESTES (Adicionado) ---
+        ctk.CTkLabel(sidebar, text="Opções de Teste", font=("", 14, "bold")).pack(
+            anchor="w", padx=12, pady=(10, 5)
         )
-        switch_btn.pack(fill="x", padx=12, pady=(0, 12))
+        self.test_frame = ctk.CTkFrame(sidebar, fg_color="transparent")
+        self.test_frame.pack(fill="x", padx=8, pady=5)
+
+        self.sw_err = ctk.CTkSwitch(
+            self.test_frame, text="Erro (Corromper)", command=self.toggle_error
+        )
+        self.sw_err.pack(pady=5, anchor="w")
+
+        self.sw_drop_pkt = ctk.CTkSwitch(
+            self.test_frame, text="Desc. Pacotes", command=self.toggle_drop_pkt
+        )
+        self.sw_drop_pkt.pack(pady=5, anchor="w")
+
+        self.sw_drop_ack = ctk.CTkSwitch(
+            self.test_frame, text="Desc. ACKs", command=self.toggle_drop_ack
+        )
+        self.sw_drop_ack.pack(pady=5, anchor="w")
+        # -----------------------------------
+
+        switch_btn = ctk.CTkButton(
+            sidebar,
+            text="Trocar usuário",
+            command=self._switch_user,
+            fg_color="firebrick",
+        )
+        switch_btn.pack(side="bottom", fill="x", padx=12, pady=12)
 
         # topbar
         topbar = ctk.CTkFrame(self)
@@ -160,20 +189,33 @@ class ChatInterface(ctk.CTk):
         self._append_line(f"✅ Logado como {self.username}")
         self.after(120, lambda: self.entry.focus())
 
+    # ------- handlers de teste -------
+    def _send_cmd(self, cmd: str):
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write(cmd + "\n")
+                self.proc.stdin.flush()
+            except Exception as e:
+                print(f"Erro enviando comando: {e}")
+
+    def toggle_error(self):
+        val = 1 if self.sw_err.get() else 0
+        self._send_cmd(f"///set_err {val}")
+
+    def toggle_drop_pkt(self):
+        val = 1 if self.sw_drop_pkt.get() else 0
+        self._send_cmd(f"///set_drop_pkt {val}")
+
+    def toggle_drop_ack(self):
+        val = 1 if self.sw_drop_ack.get() else 0
+        self._send_cmd(f"///set_drop_ack {val}")
+
     # ------- formatação estilo “nchat” -------
     def format_ts(self, dt: datetime.datetime | None = None) -> str:
         dt = dt or datetime.datetime.now()
-        # ex.: 25 Mar 2025 14:15
         return dt.strftime("%d %b %Y %H:%M")
 
     def render_message(self, sender: str, text: str, delivered: bool = True):
-        """
-        Mostra:
-        NOME (25 Mar 2025 14:15) ✓
-        mensagem
-
-        (linha em branco)
-        """
         check = " ✓" if delivered else ""
         header = f"{sender} ({self.format_ts()}){check}"
         self._append_line(header)
@@ -197,21 +239,22 @@ class ChatInterface(ctk.CTk):
             while True:
                 raw = self._q.get_nowait()
 
-                # pega apenas o payload quando vier do UDPClient
                 prefix = "💬 Servidor respondeu: "
                 payload = raw[len(prefix) :].strip() if raw.startswith(prefix) else raw
 
-                # se veio no formato "nome|mensagem", renderiza no estilo pedido
-                if "|" in payload:
-                    nome, msg = payload.split("|", 1)
-                    self.render_message(
-                        sender=(nome.strip() or "desconhecido"),
-                        text=msg.strip(),
-                        delivered=True,
-                    )
-                else:
-                    # logs/ACKs continuam aparecendo como texto puro
-                    self._append_line(payload)
+                if "|" in payload and not raw.startswith("["):
+                    # [TEST] ou [SISTEMA] não devem ser tratados como msg de chat
+                    parts = payload.split("|", 1)
+                    if len(parts) == 2:
+                        nome, msg = parts
+                        self.render_message(
+                            sender=(nome.strip() or "desconhecido"),
+                            text=msg.strip(),
+                            delivered=True,
+                        )
+                        continue
+
+                self._append_line(payload)
         except queue.Empty:
             pass
         self.after(50, self._drain_queue)
@@ -225,7 +268,8 @@ class ChatInterface(ctk.CTk):
             to_send = f"{self.username}|{msg}"
             self.proc.stdin.write(to_send + "\n")
             self.proc.stdin.flush()
-            # eco local no mesmo layout da conversa
+
+            # eco local
             self.render_message(sender=self.username, text=msg, delivered=True)
             self.entry.delete(0, "end")
         except Exception as e:
