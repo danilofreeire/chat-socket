@@ -1,10 +1,17 @@
 from socket import *
-from protocol import unpack_packet, pack_packet, FLAG_DATA, FLAG_ACK, WINDOW_SIZE
+from protocol import (
+    unpack_packet,
+    pack_packet,
+    FLAG_DATA,
+    FLAG_ACK,
+    FLAG_TEST_ERR,
+    WINDOW_SIZE,
+)
 import time
 import sys
 import threading
+import traceback
 
-# Evita problema de encoding no Windows ao imprimir acentos
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -30,60 +37,116 @@ class State:
         self.peer_window = WINDOW_SIZE
         self.lock = threading.Lock()
 
+        self.test_error = False
+        self.test_drop_packet = False
+        self.test_drop_ack = False
 
-def receiver_loop(sock: socket, st: State):
-    """Thread que escuta o servidor continuamente e:
-    - imprime mensagens de dados
-    - processa ACKs (GBN)
-    """
+
+def receiver_loop(sock: socket, st: State, serverAddress):
     sock.settimeout(0.5)
+
     while True:
         try:
             datagram, addr = sock.recvfrom(2048)
         except timeout:
-            continue
+            datagram = None
         except OSError:
-            # socket fechado
             break
-        except Exception:
-            continue
+        except Exception as e:
+            print(f"[ERRO DE DEBUG] Falha no recvfrom: {e}")
+            datagram = None
 
-        try:
-            pkt = unpack_packet(datagram)
-        except Exception:
-            continue
+        if datagram:
+            try:
+                pkt = unpack_packet(datagram)
 
-        if not pkt["checksum_ok"]:
-            # pacote corrompido, ignora
-            continue
+                if not pkt["checksum_ok"]:
+                    continue
 
+                with st.lock:
+                    # [TESTE] Descarte de Pacotes (Simulação)
+                    should_drop = False
+                    if (pkt["flags"] & FLAG_DATA) and st.test_drop_packet:
+                        print(
+                            f"\n[TEST] Pacote SEQ={pkt['seq']} recebido mas DESCARTADO (Drop Packet)."
+                        )
+                        should_drop = True
+
+                    # Se NÃO for dropado, processa e MANDA ACK
+                    if not should_drop:
+                        st.peer_window = pkt.get("win", WINDOW_SIZE)
+
+                        if pkt["flags"] & FLAG_DATA:
+                            if pkt["payload"]:
+                                msg = pkt["payload"].decode(errors="ignore").strip()
+                                if msg:
+                                    print(f"\n{msg}")
+
+                            # [NOVO] CLIENTE AGORA RESPONDE COM ACK AO SERVIDOR
+                            # Sem isso, o servidor não saberia que chegou e retransmitiria pra sempre.
+                            ack_pkt = pack_packet(
+                                version=1,
+                                flags=FLAG_ACK,
+                                seq=0,
+                                ack=pkt["seq"],  # Confirma o SEQ recebido do server
+                                window_size=WINDOW_SIZE,
+                                payload=b"",
+                            )
+                            sock.sendto(ack_pkt, serverAddress)
+
+                        # [TESTE] Descarte de ACK (Simulação)
+                        acknum = pkt.get("ack", None)
+                        dropped_ack = False
+                        if (
+                            acknum is not None
+                            and (pkt["flags"] & FLAG_ACK)
+                            and not (pkt["flags"] & FLAG_DATA)
+                        ):
+                            if st.test_drop_ack:
+                                print(
+                                    f"\n[TEST] ACK={acknum} recebido mas IGNORADO (Drop ACK)."
+                                )
+                                dropped_ack = True
+
+                        if (not dropped_ack) and acknum is not None:
+                            if acknum >= st.base - 1:
+                                st.base = acknum + 1
+                                removePackagesReceivedUpTo(st.base, st.packages)
+
+                                if st.base == st.nextSequenceNumber:
+                                    st.timer_start = None
+                                else:
+                                    st.timer_start = time.monotonic()
+
+            except Exception as e:
+                print(f"\n[ERRO CRÍTICO] Falha ao processar pacote: {e}")
+                traceback.print_exc()
+
+        # Checagem de Timeout (Retransmissão DO CLIENTE)
         with st.lock:
-            # Atualiza janela anunciada pelo servidor
-            st.peer_window = pkt.get("win", WINDOW_SIZE)
+            if (
+                st.timer_start is not None
+                and (time.monotonic() - st.timer_start) >= TIMEOUT
+            ):
+                print(
+                    f"\n[SISTEMA] Timeout! Retransmitindo seq {st.base} até {st.nextSequenceNumber-1}..."
+                )
+                st.timer_start = time.monotonic()
 
-            # Se vier payload de dados, imprime como mensagem de chat
-            if pkt["flags"] & FLAG_DATA:
-                if pkt["payload"]:
-                    msg = pkt["payload"].decode(errors="ignore").strip()
-                    if msg:
-                        print(f"\n{msg}")
-                        # re-exibe prompt visual
-                    # print("> ", end="", flush=True)
+                count = 0
+                for resend_seq in range(st.base, st.nextSequenceNumber):
+                    if resend_seq in st.packages:
+                        try:
+                            packet_to_send = st.packages[resend_seq]
+                            sock.sendto(packet_to_send, serverAddress)
+                            count += 1
+                        except Exception as e:
+                            print(
+                                f"[ERRO] Falha na retransmissão seq={resend_seq}: {e}"
+                            )
 
-            # Processa ACK
-            acknum = pkt.get("ack", None)
-            if acknum is not None and acknum >= st.base - 1:
-                st.base = acknum + 1
-                removePackagesReceivedUpTo(st.base, st.packages)
-
-                # controle do timer GBN
-                if st.base == st.nextSequenceNumber:
+                if count == 0:
                     st.timer_start = None
-                else:
-                    st.timer_start = time.monotonic()
-
-            # print(f"ACK recebido: {acknum}")
-            # print("> ", end="", flush=True)
 
 
 def main():
@@ -92,17 +155,13 @@ def main():
         serverAddress = (SERVER_NAME, SERVER_PORT)
 
         st = State()
-
         print("Digite mensagens (ou /quit pra sair):")
-        # print("> ", end="", flush=True)
 
-        # Inicia thread de recepção contínua
         recv_thr = threading.Thread(
-            target=receiver_loop, args=(clientSocket, st), daemon=True
+            target=receiver_loop, args=(clientSocket, st, serverAddress), daemon=True
         )
         recv_thr.start()
 
-        # Loop de envio (pode bloquear no stdin sem prejudicar a recepção)
         while True:
             try:
                 line = sys.stdin.readline()
@@ -112,12 +171,31 @@ def main():
                 line = ""
 
             if line is None:
-                line = ""
+                break
+
             msg = line.strip()
             if not msg:
-                # print("> ", end="", flush=True)
-                # sem entrada, volta pro prompt
-                # (a thread de recepção continua rodando)
+                continue
+
+            # Comandos
+            if msg.startswith("///"):
+                parts = msg.split()
+                cmd = parts[0]
+                val = len(parts) > 1 and parts[1] == "1"
+                with st.lock:
+                    if cmd == "///set_err":
+                        st.test_error = val
+                        print(f"[SISTEMA] Erro: {'ATIVADO' if val else 'DESATIVADO'}")
+                    elif cmd == "///set_drop_pkt":
+                        st.test_drop_packet = val
+                        print(
+                            f"[SISTEMA] Descarte de Pacotes: {'ATIVADO' if val else 'DESATIVADO'}"
+                        )
+                    elif cmd == "///set_drop_ack":
+                        st.test_drop_ack = val
+                        print(
+                            f"[SISTEMA] Descarte de ACKs: {'ATIVADO' if val else 'DESATIVADO'}"
+                        )
                 continue
 
             if msg == "/quit":
@@ -126,18 +204,15 @@ def main():
             payload = msg.encode()
 
             with st.lock:
-                # janela efetiva = min(minha_janela, janela_anunciada_pelo_servidor)
                 janela_efetiva = min(WINDOW_SIZE, st.peer_window)
-
                 if st.nextSequenceNumber >= st.base + janela_efetiva:
-                    print(
-                        f"Janela cheia (efetiva={janela_efetiva}, peer_win={st.peer_window}). Aguarde ACKs."
-                    )
-                    # print("> ", end="", flush=True)
+                    print(f"Janela cheia. Aguarde ACKs.")
                     continue
 
                 seq = st.nextSequenceNumber
-                pkt = pack_packet(
+
+                # Pacote limpo para buffer
+                pkt_clean = pack_packet(
                     version=1,
                     flags=FLAG_DATA,
                     seq=seq,
@@ -145,14 +220,25 @@ def main():
                     window_size=WINDOW_SIZE,
                     payload=payload,
                 )
-                st.packages[seq] = pkt
+                st.packages[seq] = pkt_clean
+
+                # Pacote para envio (pode ter erro)
+                pkt_to_send = pkt_clean
+                if st.test_error:
+                    print(f"[TEST] Gerando versão CORROMPIDA para SEQ={seq}...")
+                    pkt_to_send = pack_packet(
+                        version=1,
+                        flags=FLAG_DATA | FLAG_TEST_ERR,
+                        seq=seq,
+                        ack=0,
+                        window_size=WINDOW_SIZE,
+                        payload=payload,
+                    )
 
                 try:
-                    clientSocket.sendto(pkt, serverAddress)
-                # print(f"Enviando pacote seq={seq}")
+                    clientSocket.sendto(pkt_to_send, serverAddress)
                 except Exception as e:
                     print(f"Erro ao enviar: {e}")
-                    # print("> ", end="", flush=True)
                     continue
 
                 if st.base == st.nextSequenceNumber:
@@ -160,30 +246,12 @@ def main():
 
                 st.nextSequenceNumber += 1
 
-            # checa timeout GBN após envio
-            with st.lock:
-                if (
-                    st.timer_start is not None
-                    and (time.monotonic() - st.timer_start) >= TIMEOUT
-                ):
-                    print(
-                        f"Timeout! Retransmitindo {st.base}..{st.nextSequenceNumber-1}"
-                    )
-                    for resend_seq in range(st.base, st.nextSequenceNumber):
-                        try:
-                            clientSocket.sendto(st.packages[resend_seq], serverAddress)
-                        except Exception as e:
-                            print(f"Erro ao retransmitir seq={resend_seq}: {e}")
-                    st.timer_start = time.monotonic()
-
-            # print("> ", end="", flush=True)
-
     except KeyboardInterrupt:
-        print("\nInterrompido pelo usuário.")
+        print("\nInterrompido.")
     finally:
         try:
             clientSocket.close()
-        except Exception:
+        except:
             pass
 
 
