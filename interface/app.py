@@ -264,12 +264,14 @@ class ChatInterface(ctk.CTk):
         if not msg or self.proc.poll() is not None:
             return
         try:
-            # GUI envia "username|mensagem" pro cliente
-            to_send = f"{self.username}|{msg}"
+            # CORREÇÃO: Enviar apenas a mensagem. O servidor já sabe quem é você.
+            # Antes era: to_send = f"{self.username}|{msg}"
+            to_send = msg
+
             self.proc.stdin.write(to_send + "\n")
             self.proc.stdin.flush()
 
-            # eco local
+            # eco local (mantém igual)
             self.render_message(sender=self.username, text=msg, delivered=True)
             self.entry.delete(0, "end")
         except Exception as e:
