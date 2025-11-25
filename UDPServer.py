@@ -125,10 +125,15 @@ def main():
                         continue
 
                     # Mensagem normal (Encaminhamento)
+                    # a partir daqui são mensagens normais
                     sender_name = usernames.get(
                         clientAddress, f"{clientAddress[0]}:{clientAddress[1]}"
                     )
-                    forwarded_text = f"{sender_name} > {raw_text}"
+
+                    # CORREÇÃO: Usar '|' como separador para a GUI do cliente entender
+                    # Antes era: forwarded_text = f"{sender_name} > {raw_text}"
+                    forwarded_text = f"{sender_name}|{raw_text}"
+
                     data_to_send = forwarded_text.encode()
 
                     recvBufferUsage[clientAddress] = min(RECV_CAPACITY, used + 1)
